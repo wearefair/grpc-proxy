@@ -4,6 +4,7 @@
 package proxy_test
 
 import (
+	"context"
 	"io"
 	"log"
 	"net"
@@ -12,11 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mwitkow/grpc-proxy/proxy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"golang.org/x/net/context"
+	"github.com/vgough/grpc-proxy/proxy"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/grpclog"
@@ -24,7 +24,7 @@ import (
 
 	"fmt"
 
-	pb "github.com/mwitkow/grpc-proxy/testservice"
+	pb "github.com/vgough/grpc-proxy/testservice"
 )
 
 const (
@@ -49,7 +49,7 @@ func (s *assertingService) PingEmpty(ctx context.Context, _ *pb.Empty) (*pb.Ping
 	md, ok := metadata.FromIncomingContext(ctx)
 	assert.True(s.t, ok, "PingEmpty call must have metadata in context")
 	_, ok = md[clientMdKey]
-	assert.True(s.t, ok, "PingEmpty call must have clients's custom headers in metadata")
+	assert.True(s.t, ok, "PingEmpty call must have clients's custom headers in metadata: %+v", md)
 	return &pb.PingResponse{Value: pingDefaultValue, Counter: 42}, nil
 }
 
@@ -135,7 +135,8 @@ func (s *ProxyHappySuite) TestPingCarriesServerHeadersAndTrailers() {
 	out, err := s.testClient.Ping(s.ctx(), &pb.PingRequest{Value: "foo"}, grpc.Header(&headerMd), grpc.Trailer(&trailerMd))
 	require.NoError(s.T(), err, "Ping should succeed without errors")
 	require.Equal(s.T(), &pb.PingResponse{Value: "foo", Counter: 42}, out)
-	assert.Contains(s.T(), headerMd, serverHeaderMdKey, "server response headers must contain server data")
+	assert.EqualValues(s.T(), []string{"I like turtles."}, headerMd.Get(serverHeaderMdKey),
+		"server response headers must contain server data")
 	assert.Len(s.T(), trailerMd, 1, "server response trailers must contain server data")
 }
 
@@ -170,7 +171,8 @@ func (s *ProxyHappySuite) TestPingStream_FullDuplexWorks() {
 			// Check that the header arrives before all entries.
 			headerMd, err := stream.Header()
 			require.NoError(s.T(), err, "PingStream headers should not error.")
-			assert.Contains(s.T(), headerMd, serverHeaderMdKey, "PingStream response headers user contain metadata")
+			assert.EqualValues(s.T(), []string{"I like turtles."}, headerMd.Get(serverHeaderMdKey),
+				"PingStream response headers must contain server data")
 		}
 		assert.EqualValues(s.T(), i, resp.Counter, "ping roundtrip must succeed with the correct id")
 	}
@@ -186,6 +188,23 @@ func (s *ProxyHappySuite) TestPingStream_StressTest() {
 	for i := 0; i < 50; i++ {
 		s.TestPingStream_FullDuplexWorks()
 	}
+}
+
+type checkingDirector struct {
+	conn *grpc.ClientConn
+}
+
+func (c *checkingDirector) Connect(ctx context.Context, method string) (context.Context, *grpc.ClientConn, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if ok {
+		if _, exists := md[rejectingMdKey]; exists {
+			return ctx, nil, grpc.Errorf(codes.PermissionDenied, "testing rejection")
+		}
+	}
+	return ctx, c.conn, nil
+}
+
+func (c *checkingDirector) Release(ctx context.Context, conn *grpc.ClientConn) {
 }
 
 func (s *ProxyHappySuite) SetupSuite() {
@@ -204,25 +223,14 @@ func (s *ProxyHappySuite) SetupSuite() {
 	// Setup of the proxy's Director.
 	s.serverClientConn, err = grpc.Dial(s.serverListener.Addr().String(), grpc.WithInsecure(), grpc.WithCodec(proxy.Codec()))
 	require.NoError(s.T(), err, "must not error on deferred client Dial")
-	director := func(ctx context.Context, fullName string) (context.Context, *grpc.ClientConn, error) {
-		md, ok := metadata.FromIncomingContext(ctx)
-		if ok {
-			if _, exists := md[rejectingMdKey]; exists {
-				return ctx, nil, grpc.Errorf(codes.PermissionDenied, "testing rejection")
-			}
-		}
-		// Explicitly copy the metadata, otherwise the tests will fail.
-		outCtx, _ := context.WithCancel(ctx)
-		outCtx = metadata.NewOutgoingContext(outCtx, md.Copy())
-		return outCtx, s.serverClientConn, nil
-	}
+	director := &checkingDirector{conn: s.serverClientConn}
 	s.proxy = grpc.NewServer(
 		grpc.CustomCodec(proxy.Codec()),
 		grpc.UnknownServiceHandler(proxy.TransparentHandler(director)),
 	)
 	// Ping handler is handled as an explicit registration and not as a TransparentHandler.
 	proxy.RegisterService(s.proxy, director,
-		"mwitkow.testproto.TestService",
+		"vgough.testproto.TestService",
 		"Ping")
 
 	// Start the serving loops.

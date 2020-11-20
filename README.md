@@ -1,50 +1,55 @@
 # gRPC Proxy
 
-[![Travis Build](https://travis-ci.org/mwitkow/grpc-proxy.svg?branch=master)](https://travis-ci.org/mwitkow/grpc-proxy)
-[![Go Report Card](https://goreportcard.com/badge/github.com/mwitkow/grpc-proxy)](https://goreportcard.com/report/github.com/mwitkow/grpc-proxy)
-[![GoDoc](http://img.shields.io/badge/GoDoc-Reference-blue.svg)](https://godoc.org/github.com/mwitkow/grpc-proxy)
+[![Travis Build](https://travis-ci.org/vgough/grpc-proxy.svg?branch=master)](https://travis-ci.org/vgough/grpc-proxy)
+[![Go Report Card](https://goreportcard.com/badge/github.com/vgough/grpc-proxy)](https://goreportcard.com/report/github.com/vgough/grpc-proxy)
+[![GoDoc](http://img.shields.io/badge/GoDoc-Reference-blue.svg)](https://godoc.org/github.com/vgough/grpc-proxy)
 [![Apache 2.0 License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 [gRPC Go](https://github.com/grpc/grpc-go) Proxy server
 
 ## Project Goal
 
-Build a transparent reverse proxy for gRPC targets that will make it easy to expose gRPC services
-over the internet. This includes:
- * no needed knowledge of the semantics of requests exchanged in the call (independent rollouts)
- * easy, declarative definition of backends and their mappings to frontends
- * simple round-robin load balancing of inbound requests from a single connection to multiple backends
+Makes it easy to build a reverse proxy for gRPC targets.  This allows users to
+route gRPC requests based on method names and metadata without any knowledge of
+message contents.
 
-The project now exists as a **proof of concept**, with the key piece being the `proxy` package that
-is a generic gRPC reverse proxy handler.
+The project was forked from the proof of concept work in
+github.com/mwitkow/grpc-proxy, and further refined with a real router project
+running in a production environment with multiple routing topologies.
 
-## Proxy Handler
+## Proxy Package
 
-The package [`proxy`](proxy/) contains a generic gRPC reverse proxy handler that allows a gRPC server to
-not know about registered handlers or their data types. Please consult the docs, here's an exaple usage.
+The package [`proxy`](proxy/) contains a generic gRPC reverse proxy handler that
+allows a gRPC server.
 
-Defining a `StreamDirector` that decides where (if at all) to send the request
+A `StreamDirector` implementation is responsible for deciding where (if at all)
+to send a request (see example_test.go).  This contrived example demonstrates how
+a user could use the path and associated request metadata to route a request:
 ```go
-director = func(ctx context.Context, fullMethodName string) (*grpc.ClientConn, error) {
-    // Make sure we never forward internal services.
-    if strings.HasPrefix(fullMethodName, "/com.example.internal.") {
-        return nil, grpc.Errorf(codes.Unimplemented, "Unknown method")
+func (d *ExampleDirector) Connect(ctx context.Context, method string) (context.Context, *grpc.ClientConn, error) {
+  // Disable forwarding for all services prefixed with com.example.internal.
+  if strings.HasPrefix(method, "/com.example.internal.") {
+    return nil, nil, grpc.Errorf(codes.Unimplemented, "Unknown method")
+  }
+  md, ok := metadata.FromIncomingContext(ctx)
+  if ok {
+    // Decide on which backend to dial
+    if val, exists := md[":authority"]; exists && val[0] == "staging.api.example.com" {
+      // Make sure we use DialContext so the dialing can be cancelled/time out together with the context.
+      conn, err := grpc.DialContext(ctx, "api-service.staging.svc.local", grpc.WithCodec(proxy.Codec()))
+      return ctx, conn, err
+    } else if val, exists := md[":authority"]; exists && val[0] == "api.example.com" {
+      conn, err := grpc.DialContext(ctx, "api-service.prod.svc.local", grpc.WithCodec(proxy.Codec()))
+      return ctx, conn, err
     }
-    md, ok := metadata.FromContext(ctx)
-    if ok {
-        // Decide on which backend to dial
-        if val, exists := md[":authority"]; exists && val[0] == "staging.api.example.com" {
-            // Make sure we use DialContext so the dialing can be cancelled/time out together with the context.
-            return grpc.DialContext(ctx, "api-service.staging.svc.local", grpc.WithCodec(proxy.Codec()))
-        } else if val, exists := md[":authority"]; exists && val[0] == "api.example.com" {
-            return grpc.DialContext(ctx, "api-service.prod.svc.local", grpc.WithCodec(proxy.Codec()))
-        }
-    }
-    return nil, grpc.Errorf(codes.Unimplemented, "Unknown method")
+  }
+  return nil, nil, grpc.Errorf(codes.Unimplemented, "Unknown method")
 }
 ```
-Then you need to register it with a `grpc.Server`. The server may have other handlers that will be served
-locally:
+The direct is registered with a `grpc.Server`, along with a special codec which
+allows the proxy to handle raw byte frames and pass them along without
+any serialization. The server may have other handlers that will be served
+locally, and the codec will fall back to the protobuf codec when necessary:
 
 ```go
 server := grpc.NewServer(
