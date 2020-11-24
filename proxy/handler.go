@@ -75,6 +75,7 @@ func (s *handler) handler(srv interface{}, serverStream grpc.ServerStream) error
 	if _, ok := metadata.FromOutgoingContext(outCtx); !ok {
 		clientCtx = copyMetadata(clientCtx, outCtx)
 	}
+
 	clientStream, err := grpc.NewClientStream(clientCtx, clientStreamDescForProxying, backendConn, fullMethodName)
 	if err != nil {
 		return err
