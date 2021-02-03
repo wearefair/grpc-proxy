@@ -46,7 +46,7 @@ type assertingService struct {
 
 func (s *assertingService) PingEmpty(ctx context.Context, _ *pb.Empty) (*pb.PingResponse, error) {
 	// Check that this call has client's metadata.
-	md, ok := metadata.FromContext(ctx)
+	md, ok := metadata.FromIncomingContext(ctx)
 	assert.True(s.t, ok, "PingEmpty call must have metadata in context")
 	_, ok = md[clientMdKey]
 	assert.True(s.t, ok, "PingEmpty call must have clients's custom headers in metadata")
@@ -116,7 +116,7 @@ func (s *ProxyHappySuite) ctx() context.Context {
 }
 
 func (s *ProxyHappySuite) TestPingEmptyCarriesClientMetadata() {
-	ctx := metadata.NewContext(s.ctx(), metadata.Pairs(clientMdKey, "true"))
+	ctx := metadata.NewOutgoingContext(s.ctx(), metadata.Pairs(clientMdKey, "true"))
 	out, err := s.testClient.PingEmpty(ctx, &pb.Empty{})
 	require.NoError(s.T(), err, "PingEmpty should succeed without errors")
 	require.Equal(s.T(), &pb.PingResponse{Value: pingDefaultValue, Counter: 42}, out)
@@ -135,7 +135,7 @@ func (s *ProxyHappySuite) TestPingCarriesServerHeadersAndTrailers() {
 	out, err := s.testClient.Ping(s.ctx(), &pb.PingRequest{Value: "foo"}, grpc.Header(&headerMd), grpc.Trailer(&trailerMd))
 	require.NoError(s.T(), err, "Ping should succeed without errors")
 	require.Equal(s.T(), &pb.PingResponse{Value: "foo", Counter: 42}, out)
-	assert.Len(s.T(), headerMd, 1, "server response headers must contain server data")
+	assert.Contains(s.T(), headerMd, serverHeaderMdKey, "server response headers must contain server data")
 	assert.Len(s.T(), trailerMd, 1, "server response trailers must contain server data")
 }
 
@@ -148,7 +148,7 @@ func (s *ProxyHappySuite) TestPingErrorPropagatesAppError() {
 
 func (s *ProxyHappySuite) TestDirectorErrorIsPropagated() {
 	// See SetupSuite where the StreamDirector has a special case.
-	ctx := metadata.NewContext(s.ctx(), metadata.Pairs(rejectingMdKey, "true"))
+	ctx := metadata.NewOutgoingContext(s.ctx(), metadata.Pairs(rejectingMdKey, "true"))
 	_, err := s.testClient.Ping(ctx, &pb.PingRequest{Value: "foo"})
 	require.Error(s.T(), err, "Director should reject this RPC")
 	assert.Equal(s.T(), codes.PermissionDenied, grpc.Code(err))
@@ -170,7 +170,7 @@ func (s *ProxyHappySuite) TestPingStream_FullDuplexWorks() {
 			// Check that the header arrives before all entries.
 			headerMd, err := stream.Header()
 			require.NoError(s.T(), err, "PingStream headers should not error.")
-			assert.Len(s.T(), headerMd, 1, "PingStream response headers user contain metadata")
+			assert.Contains(s.T(), headerMd, serverHeaderMdKey, "PingStream response headers user contain metadata")
 		}
 		assert.EqualValues(s.T(), i, resp.Counter, "ping roundtrip must succeed with the correct id")
 	}
@@ -204,14 +204,17 @@ func (s *ProxyHappySuite) SetupSuite() {
 	// Setup of the proxy's Director.
 	s.serverClientConn, err = grpc.Dial(s.serverListener.Addr().String(), grpc.WithInsecure(), grpc.WithCodec(proxy.Codec()))
 	require.NoError(s.T(), err, "must not error on deferred client Dial")
-	director := func(ctx context.Context, fullName string) (*grpc.ClientConn, error) {
-		md, ok := metadata.FromContext(ctx)
+	director := func(ctx context.Context, fullName string) (context.Context, *grpc.ClientConn, error) {
+		md, ok := metadata.FromIncomingContext(ctx)
 		if ok {
 			if _, exists := md[rejectingMdKey]; exists {
-				return nil, grpc.Errorf(codes.PermissionDenied, "testing rejection")
+				return ctx, nil, grpc.Errorf(codes.PermissionDenied, "testing rejection")
 			}
 		}
-		return s.serverClientConn, nil
+		// Explicitly copy the metadata, otherwise the tests will fail.
+		outCtx, _ := context.WithCancel(ctx)
+		outCtx = metadata.NewOutgoingContext(outCtx, md.Copy())
+		return outCtx, s.serverClientConn, nil
 	}
 	s.proxy = grpc.NewServer(
 		grpc.CustomCodec(proxy.Codec()),
